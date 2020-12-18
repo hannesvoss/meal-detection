@@ -26,14 +26,14 @@ import matplotlib.pyplot as plt
 
 
 def main(yaml_filepath, mode):
+    # loads the neural net configurations which are saved as yaml files
     cfgs = load_cfgs(yaml_filepath)
     print("Running {} experiments.".format(len(cfgs)))
 
     for cfg in cfgs:
+        # TODO rausfinden was seed soll ?!
         seed = int(cfg['train']['seed'])
         np.random.seed(seed)
-
-        # Print the configuration - just to make sure that you loaded what you wanted to load
 
         module_dataset = load_module(cfg['dataset']['script_path'])
         module_model = load_module(cfg['model']['script_path'])

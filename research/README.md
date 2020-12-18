@@ -10,3 +10,7 @@ Blog posts:
 
 General stuff:
 * ...
+
+Additional datasources:
+* https://github.com/irinagain/Awesome-CGM
+* ...

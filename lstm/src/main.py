@@ -9,40 +9,54 @@ eingebunden werden.
 """
 
 import csv
-import datetime
 import math
-import re
 
 import matplotlib.pyplot as plt
 import pandas as pd
 from dateutil import parser
-import torch
-import torch.nn as nn
-from numpy.random.mtrand import shuffle
-from torch.utils.data import Dataset
+from matplotlib import pyplot
+from numpy import concatenate
+from pandas import DataFrame, concat, read_csv
+from sklearn.metrics import mean_squared_error
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.layers import LSTM
+import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 
-from GlucoseForecastModel import GlucoseForecastModel
-from UnannouncedMealClassifier import UnannouncedMealClassifier
+from Models import Profile
 
 __author__ = "Hannes Voß"
 __version__ = "0.1"
+
+pd.set_option('display.max_columns', 500)
 
 epochs = 10  # number of epochs per training session
 select_per_epoch = 200  # number to select per epoch per label
 feature_index = {}  # feature mapping for one-hot encoding
 
-print("Is CUDA available: ", torch.cuda.is_available())
-device = "cuda" if torch.cuda.is_available() else "cpu"
+#print("Is CUDA available: ", torch.cuda.is_available())
+#device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-class DataLoader(Dataset):
-    def __init__(self, src, tgt):
-        self.input_src = src
-        self.input_tgt = tgt
+#class DataLoader(Dataset):
+#    def __init__(self, src, tgt):
+#        self.input_src = src
+#        self.input_tgt = tgt
 
-    def __len__(self):
-        return len(self.input_src)
+#    def __len__(self):
+#        return len(self.input_src)
+
+
+def read_profile(filename: str):
+    """
+    Liest das angegebene Profil aus. Dort ist auch das verwendete Insulin angegeben.
+
+    :return: Gibt das verwendete Profil zurück.
+    """
+    # TODO: read the actual Profile instead of Dummy-Object
+
+    return Profile("Humalog", "mg/dl")
 
 
 def get_readable_glucose_data(filename: str):
@@ -64,6 +78,7 @@ def get_readable_glucose_data(filename: str):
 def get_readable_treatments_data(filename: str):
     """
     Vorbereitung der Treatment Daten.
+
     :param filename: Dateiname
     :return: Gibt die vorformatierten Treatments als Liste zurück
     """
@@ -96,194 +111,293 @@ def get_readable_treatments_data(filename: str):
     return treatment_readings
 
 
-def make_feature_vector(features, feature_index):
-    vec = torch.zeros(len(feature_index))
-    for feature in features:
-        if feature in feature_index:
-            vec[feature_index[feature]] += 1
-    return vec.view(1, -1)
-
-
-def train_model(training_data, validation_data="", evaluation_data="", num_labels=2, vocab_size=0):
-    """Train model on the given training_data
-        Tune with the validation_data
-        Evaluate accuracy with the evaluation_data
-        """
-
-    model = UnannouncedMealClassifier(num_labels, vocab_size)
-    # let's hard-code our labels for this example code
-    # and map to the same meaningful booleans in our data,
-    # so we don't mix anything up when inspecting our data
-    label_to_ix = {"not_disaster_related": 0, "disaster_related": 1}
-
-    loss_function = nn.NLLLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-
-    # epochs training
-    for epoch in range(epochs):
-        print("Epoch: " + str(epoch))
-        current = 0
-
-        # make a subset of data to use in this epoch
-        # with an equal number of items from each label
-
-        shuffle(training_data)  # randomize the order of the training data
-        related = [row for row in training_data if '1' in row[2]]
-        not_related = [row for row in training_data if '0' in row[2]]
-
-        epoch_data = related[:select_per_epoch]
-        epoch_data += not_related[:select_per_epoch]
-        shuffle(epoch_data)
-
-        # train our model
-        for item in epoch_data:
-            features = item[1].split()
-            label = int(item[2])
-
-            model.zero_grad()
-
-            feature_vec = make_feature_vector(features, feature_index)
-            target = torch.LongTensor([int(label)])
-
-            log_probs = model(feature_vec)
-
-            # compute loss function, do backward pass, and update the gradient
-            loss = loss_function(log_probs, target)
-            loss.backward()
-            optimizer.step()
-
-    fscore, auc = evaluate_model(model, evaluation_data)
-    fscore = round(fscore, 3)
-    auc = round(auc, 3)
-
-    # save model to path that is alphanumeric and includes number of items and accuracies in filename
-    timestamp = re.sub('\.[0-9]*', '_', str(datetime.datetime.now())).replace(" ", "_").replace("-", "").replace(":",
-                                                                                                                 "")
-    training_size = "_" + str(len(training_data))
-    accuracies = str(fscore) + "_" + str(auc)
-
-    model_path = "models/" + timestamp + accuracies + training_size + ".params"
-
-    torch.save(model.state_dict(), model_path)
-    return model_path
-
-
-def evaluate_model(model, evaluation_data):
-    """Evaluate the model on the held-out evaluation data
-    Return the f-value for disaster-related and the AUC
+def pre_process_data(profile: Profile, glucose: list, treatments: list):
     """
+    Die eingehenden Daten werden hier mit einander verknüpft.
+    Dazu wird für jeden CGM Timestamp die aktuelle Insulin-Wirkmenge berechnet.
 
-    related_confs = []  # related items and their confidence of being related
-    not_related_confs = []  # not related items and their confidence of being _related_
-
-    true_pos = 0.0  # true positives, etc
-    false_pos = 0.0
-    false_neg = 0.0
-
-    with torch.no_grad():
-        for item in evaluation_data:
-            _, text, label, _, _, = item
-
-            feature_vector = make_feature_vector(text.split(), feature_index)
-            log_probs = model(feature_vector)
-
-            # get confidence that item is disaster-related
-            prob_related = math.exp(log_probs.data.tolist()[0][1])
-
-            if label == "1":
-                # true label is disaster related
-                related_confs.append(prob_related)
-                if prob_related > 0.5:
-                    true_pos += 1.0
-                else:
-                    false_neg += 1.0
-            else:
-                # not disaster-related
-                not_related_confs.append(prob_related)
-                if prob_related > 0.5:
-                    false_pos += 1.0
-
-    # Get FScore
-    if true_pos == 0.0:
-        fscore = 0.0
-    else:
-        precision = true_pos / (true_pos + false_pos)
-        recall = true_pos / (true_pos + false_neg)
-        fscore = (2 * precision * recall) / (precision + recall)
-
-    # GET AUC
-    not_related_confs.sort()
-    total_greater = 0  # count of how many total have higher confidence
-    for conf in related_confs:
-        for conf2 in not_related_confs:
-            if conf < conf2:
-                break
-            else:
-                total_greater += 1
-
-    denom = len(not_related_confs) * len(related_confs)
-    auc = total_greater / denom
-
-    return [fscore, auc]
+    :param profile: Das aktuell verwendete Profil.
+    :param glucose: Die CGM Glukosedaten.
+    :param treatments: Die Insulinabgaben (Meal Bolus und Temp Basal)
+    :return: Gibt die für das Training vorbereiteten verknüpften Daten zurück.
+    """
+    # TODO start with preprocessing the data...
+    result = list()
+    for item in glucose:
+        result.append({
+            "sgv": item["sgv"],
+            "acting_insulin": 0.0
+        })
+    return np.asarray(result)
 
 
-def create_inout_sequences(input_data, tw):
-    inout_seq = []
-    L = len(input_data)
-    for i in range(L - tw):
-        train_seq = input_data[i:i + tw]
-        train_label = input_data[i + tw:i + tw + 1]
-        inout_seq.append((train_seq, train_label))
-    return inout_seq
+def generate_plot(items: list, x: str, y: str):
+    """
+    Generiert einen Pandas DataFrame Plot und gibt diesen aus.
+
+    :param items: Die anzuzeigenden Elemente.
+    :param x: Der X-Achsenabschnitt.
+    :param y: Der Y-Achsenabschnitt.
+    """
+    df = pd.DataFrame(
+        items,
+        columns=[x, y]
+    )
+    df.plot(x=x, y=y)
+    plt.show()
+
+
+# convert series to supervised learning
+def series_to_supervised(data, n_in=1, n_out=1, dropnan=True):
+    n_vars = 1 if type(data) is list else data.shape[1]
+    df = DataFrame(data)
+    cols, names = list(), list()
+    # input sequence (t-n, ... t-1)
+    for i in range(n_in, 0, -1):
+        cols.append(df.shift(i))
+        names += [('var%d(t-%d)' % (j + 1, i)) for j in range(n_vars)]
+    # forecast sequence (t, t+1, ... t+n)
+    for i in range(0, n_out):
+        cols.append(df.shift(-i))
+        if i == 0:
+            names += [('var%d(t)' % (j + 1)) for j in range(n_vars)]
+        else:
+            names += [('var%d(t+%d)' % (j + 1, i)) for j in range(n_vars)]
+    # put it all together
+    agg = concat(cols, axis=1)
+    agg.columns = names
+    # drop rows with NaN values
+    if dropnan:
+        agg.dropna(inplace=True)
+    return agg
 
 
 if __name__ == "__main__":
-    glucose = get_readable_glucose_data("assets/00390014_entries_2017-07-10_to_2017-11-08.json.csv")
-    print("Available glucose dataset: ", glucose)
-    treatments = get_readable_treatments_data("assets/00390014_treatments_2017-07-10_to_2017-11-08_aa.csv")
-    print("Available treatments dataset: ", treatments)
+    profile = read_profile("../../assets/00390014_profile_2017-07-10_to_2017-11-08.json")
 
-    df = pd.DataFrame(glucose, columns=['timestamp', 'sgv'])
-    df.plot(x='timestamp', y='sgv')
-    plt.show()
+    # start with Humalog - other insulin types later (maybe worth to rethink/reevaluate the approach?)
+    if profile.used_insulin == "Humalog" and profile.units == "mg/dl":
+        # read glucose values (simple)
+        glucose = get_readable_glucose_data("../../assets/00390014_entries_2017-07-10_to_2017-11-08.json.csv")
+        # print("Available glucose dataset: ", glucose)
 
-    df = pd.DataFrame(treatments, columns=['timestamp', 'insulin'])
-    df.plot(x='timestamp', y='insulin')
-    plt.show()
+        # read treatment values (simple)
+        treatments = get_readable_treatments_data("../../assets/00390014_treatments_2017-07-10_to_2017-11-08_aa.csv")
+        # print("Available treatments dataset: ", treatments)
+
+        # start with the data preparation
+        preprocessed_training_input = pre_process_data(
+            profile=profile,
+            glucose=glucose,
+            treatments=treatments
+        )
+
+        # print(preprocessed_training_input)
+
+        # create dataframes for plots
+        # generate_plot(glucose, "timestamp", "sgv")
+        # generate_plot(treatments, "timestamp", "insulin")
+
+        # create training dataframe
+        #train_df = pd.DataFrame({
+        #    'inputs': preprocessed_training_input[:5],
+        #    'outputs': preprocessed_training_input[5:10]
+        #})
+
+        #print(train_df)
+
+        #dataset = tf.data.Dataset.from_tensor_slices(train_df)
+        #for item in dataset:
+        #    print(item)
+
+        # load dataset
+        dataset = read_csv('../../assets/letsgo.csv', header=0, index_col=0)
+        values = dataset.values
+        print("Raw values: ", values)
+
+        #groups = [0, 1]
+        #i = 1
+        # plot each column
+        #pyplot.figure()
+        #for group in groups:
+        #    pyplot.subplot(len(groups), 1, i)
+        #    pyplot.plot(values[:, group])
+        #    pyplot.title(dataset.columns[group], y=0.5, loc='right')
+        #    i += 1
+        #pyplot.show()
+
+        # TODO use for one-hot values
+        # integer encode direction
+        # encoder = LabelEncoder()
+        # values[:, 4] = encoder.fit_transform(values[:, 4])
+
+        # ensure all data is float
+        values = values.astype('float32')
+
+        # values[0][0] -> sgv
+        # values[0][1] -> active_insulin
+        # print("Encoded values: ", values)
+        print("Printing out the values BEFORE scaling with MinMaxScaler...")
+        print("Unscaled \'sgv\': ", values[0][0])
+        print("Unscaled \'active_insulin\': ", values[0][1])
+
+        print("Unscaled values array: ", values)
+
+        # normalize features
+        scaler = MinMaxScaler()
+        scaled = scaler.fit_transform(values)
+
+        print("Scaled values shape: ", scaled.shape)
+        print("Scaled values array: ", scaled)
+
+        print("Printing out the values of the first record...")
+        print("Scaled \'sgv\': ", scaled[0][0])
+        print("Scaled \'active_insulin\': ", scaled[0][1])
+
+        # specify the number of lag entries (TODO recalc due to the cgm specialties)
+        n_entries = 12
+        n_features = 2
+
+        # frame as supervised learning
+        reframed = series_to_supervised(scaled, n_entries, 1)
+        print("Reframed values shape: ", reframed.shape)
+
+        # drop columns we don't want to predict (acting_insulin)
+        reframed.drop(reframed.columns[[0, 2]], axis=1, inplace=True)
+        print(reframed.head())
+
+        # split into train and test sets
+        values = reframed.values
+        n_train_hours = 24 * 12 * 30  # 30 days (12 entries per hour - times 24 hours)
+        train = values[:n_train_hours, :]
+        test = values[n_train_hours:, :]
+
+        print("Split the datasets into train and test...")
+        print("train: size -> ", len(train))
+        print("test: size -> ", len(test))
+
+        # split into input and outputs
+        n_obs = n_entries * n_features
+        train_X, train_y = train[:, :n_obs], train[:, -n_features]
+        test_X, test_y = test[:, :n_obs], test[:, -n_features]
+        print(train_X.shape, len(train_X), train_y.shape)
+
+        # train_X shape ist 'mal 6' so groß wegen der temporalen Abhängigkeit zu den nächsten Werten
+
+        # reshape input to be 3D [samples, timesteps, features]
+        train_X = train_X.reshape((
+            train_X.shape[0],
+            n_entries,
+            n_features
+        ))
+        test_X = test_X.reshape((
+            test_X.shape[0],
+            n_entries,
+            n_features
+        ))
+
+        print(train_X.shape, train_y.shape, test_X.shape, test_y.shape)
+
+        print("train_X.shape[1]: ", train_X.shape[1])
+        print("train_X.shape[2]: ", train_X.shape[2])
+
+        # design network
+        model = Sequential()
+        model.add(LSTM(50, input_shape=(train_X.shape[1], train_X.shape[2])))
+        model.add(Dense(1))
+        model.compile(loss='mae', optimizer='adam')
+
+        print("important: ", train_X, train_y)
+
+        # fit network
+        history = model.fit(
+            train_X,
+            train_y,
+            epochs=50,
+            batch_size=72,
+            validation_data=(test_X, test_y),
+            verbose=2,
+            shuffle=False
+        )
+
+        # plot history
+        pyplot.plot(history.history['loss'], label='train')
+        pyplot.plot(history.history['val_loss'], label='test')
+        pyplot.legend()
+        pyplot.show()
+
+        print("test_X -> ", test_X)
+
+        # make a prediction
+        yhat = model.predict(test_X)
+        print("yhat shape: ", yhat.shape)
+
+        test_X = test_X.reshape(
+            (test_X.shape[0], n_entries * n_features)
+        )
+        print("test_X shape: ", test_X.shape)
+
+        # invert scaling for forecast
+        inv_yhat = concatenate(
+            (yhat, test_X[:, -1:]),
+            axis=1
+        )
+        print("inv_yhat shape: ", inv_yhat.shape)
+
+        inv_yhat = scaler.inverse_transform(inv_yhat)
+        inv_yhat = inv_yhat[:, 0]
+
+        # invert scaling for actual
+        test_y = test_y.reshape((len(test_y), 1))
+        inv_y = concatenate((test_y, test_X[:, -1:]), axis=1)
+        inv_y = scaler.inverse_transform(inv_y)
+        inv_y = inv_y[:, 0]
+
+        print("Predicted SGV: ", inv_yhat, " - actual SGV: ", inv_y)
+
+        # try to predict on cool data
+        cool = np.asarray([[100.0, 10.0], [105.0, 10.0], [109.0, 10.0]])
+        cool_scaled = scaler.transform(cool)
+        prediction = model.predict(cool_scaled)
+        print(prediction)
+
+        # calculate RMSE
+        rmse = math.sqrt(mean_squared_error(inv_y, inv_yhat))
+        print('Test RMSE: %.3f' % rmse)
 
     # do glucose forecasting
-    train_data = glucose
+    # train_data = glucose
 
-    scaler = MinMaxScaler(feature_range=(-1, 1))
-    train_data_normalized = scaler.fit_transform(train_data.reshape(-1, 1))
+    # scaler = MinMaxScaler(feature_range=(-1, 1))
+    # train_data_normalized = scaler.fit_transform(train_data.reshape(-1, 1))
 
-    train_window = 12
-    train_data_normalized = torch.FloatTensor(train_data_normalized).view(-1)
-    train_inout_seq = create_inout_sequences(train_data_normalized, train_window)
-    print(train_inout_seq[:5])
+    # train_window = 12
+    # train_data_normalized = torch.FloatTensor(train_data_normalized).view(-1)
+    # train_inout_seq = create_inout_sequences(train_data_normalized, train_window)
+    # print(train_inout_seq[:5])
 
-    model = GlucoseForecastModel()
-    loss_function = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    # model = GlucoseForecastModel()
+    # loss_function = nn.MSELoss()
+    # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    print(model)
+    # print(model)
 
-    epochs = 150
-    for i in range(epochs):
-        for seq, labels in train_inout_seq:
-            optimizer.zero_grad()
-            model.hidden_cell = (
-                torch.zeros(1, 1, model.hidden_layer_size),
-                torch.zeros(1, 1, model.hidden_layer_size)
-            )
+    # epochs = 150
+    # for i in range(epochs):
+    #    for seq, labels in train_inout_seq:
+    #        optimizer.zero_grad()
+    #        model.hidden_cell = (
+    #            torch.zeros(1, 1, model.hidden_layer_size),
+    #            torch.zeros(1, 1, model.hidden_layer_size)
+    #        )
 
-            y_pred = model(seq)
+    #        y_pred = model(seq)
 
-            single_loss = loss_function(y_pred, labels)
-            single_loss.backward()
-            optimizer.step()
+    #        single_loss = loss_function(y_pred, labels)
+    #        single_loss.backward()
+    #        optimizer.step()
 
-        if i % 25 == 1:
-            print(f'epoch: {i:3} loss: {single_loss.item():10.8f}')
+    #    if i % 25 == 1:
+    #        print(f'epoch: {i:3} loss: {single_loss.item():10.8f}')
 
-    print(f'epoch: {i:3} loss: {single_loss.item():10.10f}')
+    # print(f'epoch: {i:3} loss: {single_loss.item():10.10f}')
